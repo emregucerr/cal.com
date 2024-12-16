@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW "routing_form_response" AS
+CREATE OR REPLACE VIEW "RoutingFormResponse" AS
 WITH attendees_agg AS (
   SELECT 
     a."bookingId",

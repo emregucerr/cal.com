@@ -7,7 +7,7 @@ import {
 } from "@calcom/app-store/routing-forms/zod";
 import dayjs from "@calcom/dayjs";
 import type { ColumnFilter, TypedColumnFilter, SortingState } from "@calcom/features/data-table";
-import { makeWhereClause, makeRawWhereClause } from "@calcom/features/data-table/lib/server";
+import { makeWhereClause, makeRawWhereClause, makeRawOrderBy } from "@calcom/features/data-table/lib/server";
 import { readonlyPrisma as prisma } from "@calcom/prisma";
 import type { BookingStatus } from "@calcom/prisma/enums";
 
@@ -389,11 +389,13 @@ class RoutingEventsInsights {
       organizationId,
       routingFormId,
     });
-    const formsTeamWhereClause = [];
+    const formsTeamWhereClause: Prisma.Sql[] = [];
     if (typeof formsTeamWhereCondition.teamId === "number") {
       formsTeamWhereClause.push(Prisma.sql`"formTeamId" = ${formsTeamWhereCondition.teamId}`);
     } else if (Array.isArray(formsTeamWhereCondition.teamId?.in)) {
-      formsTeamWhereClause.push(Prisma.sql`"formTeamId" IN (${formsTeamWhereCondition.teamId.in.join(",")})`);
+      formsTeamWhereClause.push(
+        Prisma.sql`"formTeamId" IN (${Prisma.join(formsTeamWhereCondition.teamId.in, ",")})`
+      );
     }
     if (formsTeamWhereCondition.id) {
       formsTeamWhereClause.push(Prisma.sql`"formId" = ${formsTeamWhereCondition.id}`);
@@ -403,159 +405,117 @@ class RoutingEventsInsights {
     const assignmentReason = columnFilters.find((filter) => filter.id === "assignmentReason") as
       | TypedColumnFilter<"text">
       | undefined;
-    const fieldFilters = columnFilters.filter(
+    const attributeFilters = columnFilters.filter(
       (filter) => filter.id !== "bookingStatus" && filter.id !== "assignmentReason"
     );
 
-    await prisma.$queryRaw<RoutingFormResponse[]>`
-      SELECT * FROM "RoutingFormResponse"
-      WHERE
-        TRUE
-        ${formsTeamWhereClause.length > 0 ? Prisma.sql`AND ${formsTeamWhereClause.join(" AND ")}` : ""}
-        ${
-          bookingStatus
-            ? Prisma.sql`AND ${makeRawWhereClause({
-                columnName: "bookingStatus",
-                filterValue: bookingStatus.value,
-              })}`
-            : ""
-        }
+    const whereClause = Prisma.sql`
+      TRUE
+      ${
+        formsTeamWhereClause.length > 0
+          ? Prisma.sql`AND ${Prisma.join(formsTeamWhereClause, " AND ")}`
+          : Prisma.empty
+      }
+      ${
+        bookingStatus
+          ? Prisma.sql`AND ${makeRawWhereClause({
+              columnName: "bookingStatus",
+              filterValue: bookingStatus.value,
+            })}`
+          : Prisma.empty
+      }
+      ${
+        assignmentReason && assignmentReason.value.data.operator === "isEmpty"
+          ? Prisma.sql`AND ("bookingAssignmentReasons" IS NULL OR "bookingAssignmentReasons"::jsonb = '[]'::jsonb)`
+          : Prisma.empty
+      }
+      ${
+        assignmentReason && assignmentReason.value.data.operator === "isNotEmpty"
+          ? Prisma.sql`AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements("bookingAssignmentReasons"::jsonb) AS reasons
+              WHERE reasons->>'reasonString' != ''
+            )`
+          : Prisma.empty
+      }
+      ${
+        assignmentReason &&
+        assignmentReason.value.data.operator !== "isEmpty" &&
+        assignmentReason.value.data.operator !== "isNotEmpty"
+          ? Prisma.sql`AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements("bookingAssignmentReasons"::jsonb) AS reasons
+              WHERE ${makeRawWhereClause({
+                columnName: "reasons->>'reasonString'",
+                filterValue: assignmentReason.value,
+              })}
+            )`
+          : Prisma.empty
+      }
+      ${
+        startDate &&
+        endDate &&
+        Prisma.sql`AND "createdAt" BETWEEN ${dayjs(startDate).startOf("day").toDate()} AND ${dayjs(endDate)
+          .endOf("day")
+          .toDate()}`
+      }
+      ${
+        attributeFilters.length > 0
+          ? Prisma.sql`AND ${Prisma.join(
+              attributeFilters.map((filter) =>
+                makeRawWhereClause({
+                  columnName: `response->>'${filter.id}'`,
+                  filterValue: filter.value,
+                })
+              ),
+              " AND "
+            )}`
+          : Prisma.empty
+      }
     `;
 
-    let bookingWhereInput: Prisma.BookingWhereInput = {};
-    if (userId) {
-      bookingWhereInput.userId = userId;
-    }
-    if (bookingStatus) {
-      bookingWhereInput = {
-        ...bookingWhereInput,
-        ...makeWhereClause({ columnName: "status", filterValue: bookingStatus.value }),
-      };
-    }
-    if (assignmentReason) {
-      const operator = assignmentReason.value.data.operator;
-      if (operator === "isEmpty") {
-        bookingWhereInput.assignmentReason = { none: {} };
-      } else if (operator === "isNotEmpty") {
-        bookingWhereInput.assignmentReason = {
-          some: {
-            reasonString: {
-              not: "",
-            },
-          },
-        };
-      } else {
-        bookingWhereInput.assignmentReason = {
-          some: makeWhereClause({ columnName: "reasonString", filterValue: assignmentReason.value }),
-        };
+    const totalCountPromise = prisma.$queryRaw<{ count: number }[]>`
+      SELECT count(1) FROM "RoutingFormResponse"
+      WHERE ${whereClause}
+    `.then((result) => result[0].count);
+
+    const orderByClause =
+      makeRawOrderBy(sorting) ??
+      Prisma.sql`
+      "createdAt" DESC
+    `;
+
+    const responsesPromise = prisma.$queryRaw<RoutingFormResponse[]>`
+      SELECT
+        "id",
+        "response",
+        "formId",
+        "formName",
+        "bookingUid",
+        "bookingStatus",
+        "bookingStatusOrder",
+        "bookingCreatedAt",
+        "bookingAttendees",
+        "bookingUserId",
+        "bookingUserName",
+        "bookingUserEmail",
+        "bookingUserAvatarUrl",
+        "bookingAssignmentReasons",
+        "createdAt"
+      FROM "RoutingFormResponse"
+      WHERE ${whereClause}
+      ORDER BY ${orderByClause}
+      ${limit ? Prisma.sql`LIMIT ${limit + 1}` : Prisma.empty}
+      ${
+        cursor
+          ? Prisma.sql`OFFSET (SELECT COUNT(1) FROM "RoutingFormResponse" WHERE id < ${cursor})`
+          : Prisma.empty
       }
-    }
+    `;
 
-    const responsesWhereCondition: Prisma.App_RoutingForms_FormResponseWhereInput = {
-      ...(startDate &&
-        endDate && {
-          createdAt: {
-            gte: dayjs(startDate).startOf("day").toDate(),
-            lte: dayjs(endDate).endOf("day").toDate(),
-          },
-        }),
-      ...(Object.keys(bookingWhereInput).length > 0 ? { routedToBooking: bookingWhereInput } : {}),
-      form: formsTeamWhereCondition,
-    };
-
-    if (fieldFilters.length > 0) {
-      responsesWhereCondition.AND = fieldFilters.map((fieldFilter) => {
-        // NOTE: We cannot perform case-insensitive search on the `response` column (jsonb),
-        // until we normalize this table, use raw sql, or filter at the application level.
-        return makeWhereClause({
-          columnName: "response",
-          filterValue: fieldFilter.value,
-          json: { path: [fieldFilter.id, "value"] },
-        });
-      });
-    }
-
-    const totalResponsePromise = prisma.app_RoutingForms_FormResponse.count({
-      where: responsesWhereCondition,
-    });
-
-    const getOrder = (desc?: boolean) => (desc ? ("desc" as const) : ("asc" as const));
-
-    const orderBy = sorting
-      .map((sort) => {
-        if (sort.id === "bookingStatus") {
-          return {
-            routedToBooking: {
-              status: getOrder(sort.desc),
-            },
-          };
-        } else if (sort.id === "bookingAt") {
-          return {
-            routedToBooking: {
-              createdAt: getOrder(sort.desc),
-            },
-          };
-        } else if (sort.id === "createdAt") {
-          return {
-            createdAt: getOrder(sort.desc),
-          };
-        }
-      })
-      .filter((item) => item !== undefined);
-
-    const responsesPromise = prisma.app_RoutingForms_FormResponse.findMany({
-      select: {
-        id: true,
-        response: true,
-        form: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-        routedToBooking: {
-          select: {
-            uid: true,
-            status: true,
-            createdAt: true,
-            attendees: {
-              select: {
-                timeZone: true,
-                email: true,
-              },
-            },
-            user: {
-              select: { id: true, name: true, email: true, avatarUrl: true },
-            },
-            assignmentReason: {
-              select: { reasonString: true },
-            },
-          },
-        },
-        createdAt: true,
-      },
-      where: responsesWhereCondition,
-      orderBy:
-        orderBy.length > 0
-          ? orderBy
-          : {
-              createdAt: "desc",
-            },
-      take: limit ? limit + 1 : undefined, // Get one extra item to check if there are more pages
-      cursor: cursor ? { id: cursor } : undefined,
-    });
-
-    const [totalResponses, responses] = await Promise.all([totalResponsePromise, responsesPromise]);
-
-    // Parse response data
-    const parsedResponses = responses.map((r) => {
-      const responseData = routingFormResponseInDbSchema.parse(r.response);
-      return { ...r, response: responseData };
-    });
+    const [totalResponses, responses] = await Promise.all([totalCountPromise, responsesPromise]);
 
     return {
       total: totalResponses,
-      data: parsedResponses,
+      data: responses,
       nextCursor: responses.length > (limit ?? 0) ? responses[responses.length - 1].id : undefined,
     };
   }
